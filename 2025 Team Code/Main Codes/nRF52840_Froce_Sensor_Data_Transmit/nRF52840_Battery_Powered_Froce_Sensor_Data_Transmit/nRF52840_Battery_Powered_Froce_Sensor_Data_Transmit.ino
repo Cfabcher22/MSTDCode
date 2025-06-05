@@ -79,7 +79,7 @@ void setup() {
   }
 
   // BLE configuration
-  BLE.setLocalName("XIAO_nRF52840");
+  BLE.setLocalName("Force Sensing Unit 1");
   BLE.setAdvertisedService(forceService);
   forceService.addCharacteristic(forceDataCharacteristic);
   BLE.addService(forceService);
