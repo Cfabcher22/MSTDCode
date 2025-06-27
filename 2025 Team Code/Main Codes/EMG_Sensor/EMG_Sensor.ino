@@ -5,18 +5,17 @@
   Output: Smoothed EMG signal printed to Serial Monitor and Plotter
 */
 
-#define EMG_PIN A0         // EMG signal connected to Analog Pin A0 (D0 on XIAO nRF52840)
-const int BUFFER_SIZE = 10; // Size for moving average smoothing
+#define EMG_PIN 0           // Using pin D0 (also A0 on XIAO nRF52840)
+const int BUFFER_SIZE = 10; // Moving average buffer size
 int buffer[BUFFER_SIZE];
 int bufferIndex = 0;
 
 void setup() {
-  Serial.begin(115200);    // Initialize serial communication
-  while (!Serial);         // Wait for Serial Monitor to open (important for nRF boards)
+  Serial.begin(115200);
+  while (!Serial);
 
-  pinMode(EMG_PIN, INPUT); // Set the EMG pin as input
+  pinMode(EMG_PIN, INPUT);
 
-  // Initialize buffer with zeros
   for (int i = 0; i < BUFFER_SIZE; i++) {
     buffer[i] = 0;
   }
@@ -24,22 +23,27 @@ void setup() {
   Serial.println("EMG Monitoring Started...");
 }
 
-void loop() {
-  int rawEMG = analogRead(EMG_PIN); // Read raw analog value (0–1023 or 0–4095 based on board)
-  
-  // Store value in buffer for smoothing
+void sampleAndPrint() {
+  int rawEMG = analogRead(EMG_PIN);
+
   buffer[bufferIndex] = rawEMG;
   bufferIndex = (bufferIndex + 1) % BUFFER_SIZE;
 
-  // Compute moving average
   int sum = 0;
   for (int i = 0; i < BUFFER_SIZE; i++) {
     sum += buffer[i];
   }
   int smoothedEMG = sum / BUFFER_SIZE;
 
-  // Output the smoothed value
   Serial.println(smoothedEMG);
+}
 
-  delay(5); // Adjust delay for sampling rate (200 Hz here)
+void loop() {
+  sampleAndPrint();  // Sample 1
+  delay(500);        // Wait 0.5s
+
+  sampleAndPrint();  // Sample 2
+  delay(500);        // Wait 0.5s
+
+  delay(500);        // Pause 0.5s before repeating
 }
