@@ -2,14 +2,14 @@
   GIGA R1 WiFi — MAIN (Central to GIGA_RECEIVER)
 
   Subscribes to:
-    - Force Forward: b39a1002-0f3b-4b6c-a8ad-5c8471a40101 ("<ms>|<lbs>")
+    - Force Forward Char: b39a1002-0f3b-4b6c-a8ad-5c8471a40101 ("<ms>|<lbs>")
     - UART TX (Receiver -> Main): 6e400003-b5a3-f393-e0a9-e50e24dcca9e
   Writes to:
     - UART RX (Main -> Receiver): 6e400002-b5a3-f393-e0a9-e50e24dcca9e
 
-  Serial (115200):
-    - Prints "ms,pounds" header then CSV lines
-    - Type a line + Enter to send chat to Receiver
+  Behavior:
+    - Prints "ms,pounds" header then CSV lines as they arrive.
+    - Whenever it receives "Hello MSTD Team" from Receiver, replies "Devil Dog!".
 */
 
 #include <Arduino.h>
@@ -27,7 +27,6 @@ BLECharacteristic chUartTX;
 BLECharacteristic chUartRX;
 
 bool headerPrinted = false;
-static const uint32_t SERIAL_BAUD = 115200;
 
 bool connectToReceiver() {
   Serial.println("[MAIN] Scanning for GIGA_RECEIVER ...");
@@ -86,29 +85,15 @@ bool connectToReceiver() {
   }
 }
 
-// ---- UART write: 20-byte chunks + newline termination ----
-void writeUartRXChunked(const uint8_t* data, size_t len) {
-  const size_t CHUNK = 20;
-  for (size_t i = 0; i < len; i += CHUNK) {
-    size_t n = (len - i < CHUNK) ? (len - i) : CHUNK;
-    chUartRX.writeValue(data + i, n);
-    BLE.poll();
-  }
+// --- Write small replies safely (<= 20 B per write) ---
+void sendReplyToReceiver(const char* msg) {
+  // keep under 20 B for default MTU; our string is tiny
+  chUartRX.writeValue((const uint8_t*)msg, strlen(msg));
+  BLE.poll();
 }
-void sendLineToReceiver(const char* msg) {
-  char line[128];
-  size_t m = strlen(msg);
-  if (m > sizeof(line) - 2) m = sizeof(line) - 2;
-  memcpy(line, msg, m);
-  line[m++] = '\n';
-  line[m] = 0;
-  writeUartRXChunked((const uint8_t*)line, m);
-}
-
-String serialBuf;
 
 void setup() {
-  Serial.begin(SERIAL_BAUD);
+  Serial.begin(115200);
   while (!Serial && millis() < 2000) {}
 
   if (!BLE.begin()) {
@@ -135,7 +120,7 @@ void loop() {
     headerPrinted = true;
   }
 
-  // Incoming force data
+  // Incoming force data (forwarded by Receiver)
   if (chForce && chForce.valueUpdated()) {
     char buf[48] = {0};
     int n = chForce.readValue((uint8_t*)buf, sizeof(buf)-1);
@@ -152,30 +137,21 @@ void loop() {
     }
   }
 
-  // Incoming chat from Receiver
+  // Incoming "Hello MSTD Team" from Receiver -> reply "Devil Dog!"
   if (chUartTX && chUartTX.valueUpdated()) {
-    uint8_t buf[64] = {0};
-    int n = chUartTX.readValue(buf, sizeof(buf)-1);
+    char inbuf[24] = {0};
+    int n = chUartTX.readValue((uint8_t*)inbuf, sizeof(inbuf)-1);
     if (n > 0) {
-      Serial.print("RECV> ");
-      Serial.write(buf, n);
-      Serial.println();
-    }
-  }
+      // Optional: print what we got
+      Serial.print("[MAIN] Msg from RECV: ");
+      Serial.println(inbuf);
 
-  // Read MAIN Serial → send to Receiver
-  while (Serial.available()) {
-    char c = (char)Serial.read();
-    if (c == '\r') continue;
-    if (c == '\n') {
-      if (serialBuf.length()) {
-        sendLineToReceiver(serialBuf.c_str());
-        serialBuf = "";
+      if (strncmp(inbuf, "Hello MSTD Team", 15) == 0) {
+        sendReplyToReceiver("Devil Dog!");
+        Serial.println("[MAIN] Replied: Devil Dog!");
       }
-    } else {
-      if (serialBuf.length() < 120) serialBuf += c;
     }
   }
 
-  delay(2);
+  delay(1);
 }
