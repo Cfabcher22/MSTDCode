@@ -1,93 +1,80 @@
+// Include the ArduinoBLE library to enable Bluetooth Low Energy communication
 #include <ArduinoBLE.h>
 
-BLEDevice peripheral;
-BLECharacteristic messageCharacteristic;
+// === Constants ===
+// These UUIDs must match the service and characteristic from the BLE peripheral (e.g., your nRF52840 board)
+const char* targetDeviceName = "Force Sensing Unit 1";   // Name of the peripheral you're trying to connect to
+const char* forceServiceUUID = "180C";                   // UUID of the custom BLE service (for organization)
+const char* forceCharUUID = "2A56";                      // UUID of the characteristic sending force data
 
-unsigned long connectionMillis = 0;
-unsigned long lastMessageMillis = 0;
+// === Global BLE Objects ===
+BLEDevice peripheral;                // Represents the connected BLE peripheral device
+BLECharacteristic forceCharacteristic;  // Will hold the characteristic used to read force data from the peripheral
 
+// === SETUP ===
 void setup() {
-  Serial.begin(115200);
-  while (!Serial);
+  Serial.begin(115200);             // Start the serial monitor at 115200 baud
+  while (!Serial);                  // Wait until the serial monitor is connected (important for GIGA boards)
 
-  if (!BLE.begin()) {
+  // Initialize the BLE hardware
+  if (!BLE.begin()) {               // If initialization fails, halt execution
     Serial.println("Starting BLE failed!");
-    while (1);
+    while (1);                      // Infinite loop to prevent further code execution
   }
 
-  Serial.println("BLE Central - Scanning...");
+  Serial.println("Scanning for peripheral...");
+
+  // Start actively scanning for available BLE devices
   BLE.scan();
 }
 
+// === LOOP ===
 void loop() {
-  if (!peripheral) {
-    peripheral = BLE.available();
-    if (peripheral && peripheral.localName() == "XIAO_nRF52840") {
-      Serial.println("Found XIAO_nRF52840. Connecting...");
-      BLE.stopScan();
+  // If not connected to a peripheral yet, try to find and connect
+  if (!peripheral || !peripheral.connected()) {
+    peripheral = BLE.available();  // Check if a BLE device is available during scan
 
+    // Check if the discovered device matches the name we're looking for
+    if (peripheral && peripheral.localName() == targetDeviceName) {
+      Serial.print("Found ");
+      Serial.println(targetDeviceName);
+
+      BLE.stopScan();  // Stop scanning once we find the correct peripheral
+
+      // Attempt to connect to the discovered device
       if (peripheral.connect()) {
-        Serial.println("Connected!");
-        connectionMillis = millis();
-        lastMessageMillis = 0;
+        Serial.println("Connected to peripheral");
 
+        // Discover all available services and characteristics on the connected device
         if (peripheral.discoverAttributes()) {
-          messageCharacteristic = peripheral.characteristic("2A56");
-          if (messageCharacteristic) {
-            messageCharacteristic.subscribe();
-            Serial.println("Subscribed to characteristic!");
+          // Retrieve the characteristic that will send force data
+          forceCharacteristic = peripheral.characteristic(forceCharUUID);
+
+          // If the characteristic is found, subscribe to its notifications
+          if (forceCharacteristic) {
+            forceCharacteristic.subscribe();  // Enable notifications from this characteristic
+            Serial.println("Subscribed to force data notifications");
           } else {
-            Serial.println("Characteristic not found.");
-            peripheral.disconnect();
-            BLE.scan();
+            Serial.println("Force characteristic not found");
           }
-        }
-      } else {
-        Serial.println("Connection failed.");
-        BLE.scan();
-      }
-    }
-  } else if (peripheral.connected()) {
-    if (messageCharacteristic && messageCharacteristic.valueUpdated()) {
-      int length = messageCharacteristic.valueLength();
-      uint8_t buffer[length + 1];
-      messageCharacteristic.readValue(buffer, length);
-      buffer[length] = '\0';
-
-      String message = (char*)buffer;
-      int separatorIndex = message.indexOf('|');
-
-      if (separatorIndex != -1) {
-        String timestamp = message.substring(0, separatorIndex);
-        String poundsStr = message.substring(separatorIndex + 1);
-
-        float pounds = poundsStr.toFloat();
-        unsigned long now = millis();
-
-        Serial.println("----------------------------------------------------");
-        Serial.print("Force: ");
-        Serial.print(pounds, 2);
-        Serial.println(" lbs");
-
-        Serial.print("Time since connection: ");
-        Serial.println(now - connectionMillis);
-
-        if (lastMessageMillis > 0) {
-          Serial.print("Time since last message: ");
-          Serial.println(now - lastMessageMillis);
         } else {
-          Serial.println("First message received.");
+          Serial.println("Attribute discovery failed");  // Services or characteristics couldn't be read
         }
-
-        lastMessageMillis = now;
-        Serial.println("----------------------------------------------------");
       } else {
-        Serial.println("Malformed message.");
+        Serial.println("Failed to connect");  // BLE.connect() failed
+        BLE.scan();                          // Restart scanning for devices
       }
     }
-  } else {
-    Serial.println("Peripheral disconnected. Scanning...");
-    peripheral = BLEDevice();
-    BLE.scan();
+  }
+
+  // If connected and new data was received via BLE notification
+  if (peripheral.connected() && forceCharacteristic.valueUpdated()) {
+    int len = forceCharacteristic.valueLength();  // Get the length of the received data
+    char buffer[50];                              // Allocate a buffer to store incoming string
+    memcpy(buffer, forceCharacteristic.value(), len);  // Copy the raw data into the buffer
+    buffer[len] = '\0';                           // Null-terminate to make it a valid C-string
+
+    Serial.print("Received: ");
+    Serial.println(buffer);                      // Display the received message in the serial monitor
   }
 }
