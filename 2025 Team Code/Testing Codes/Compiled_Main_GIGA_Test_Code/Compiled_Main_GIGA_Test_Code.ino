@@ -1,28 +1,25 @@
 /*
-  GIGA R1 WiFi — MAIN
-  Role: CENTRAL to "GIGA_RECEIVER"
+  GIGA R1 WiFi — MAIN (Central to GIGA_RECEIVER)
 
   Subscribes to:
-    - Force Forward Char: b39a1002-0f3b-4b6c-a8ad-5c8471a40101 (payload "<ms>|<lbs>")
+    - Force Forward: b39a1002-0f3b-4b6c-a8ad-5c8471a40101 ("<ms>|<lbs>")
     - UART TX (from Receiver): 6e400003-b5a3-f393-e0a9-e50e24dcca9e
-
   Writes to:
     - UART RX (to Receiver): 6e400002-b5a3-f393-e0a9-e50e24dcca9e
 
-  Usage:
-    - Open Serial Monitor (115200) on MAIN, type a line and press enter → sent to Receiver.
-    - Chat from Receiver appears with "RECV>".
-    - Force stream prints CSV as: ms,pounds
+  Serial (115200):
+    - Prints "ms,pounds" header, then CSV lines.
+    - Type a line + Enter to send chat to Receiver.
 */
 
+#include <Arduino.h>
 #include <ArduinoBLE.h>
 
 static const char* RECEIVER_NAME = "GIGA_RECEIVER";
 
-// UUIDs (must match Receiver)
 #define FORWARD_CHAR_UUID "b39a1002-0f3b-4b6c-a8ad-5c8471a40101"
-#define UART_TX_UUID      "6e400003-b5a3-f393-e0a9-e50e24dcca9e" // Notify from Receiver
-#define UART_RX_UUID      "6e400002-b5a3-f393-e0a9-e50e24dcca9e" // Write to Receiver
+#define UART_TX_UUID      "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+#define UART_RX_UUID      "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 
 BLEDevice         rxDev;
 BLECharacteristic chForce;
@@ -59,13 +56,12 @@ bool connectToReceiver() {
       BLECharacteristic r = d.characteristic(UART_RX_UUID);
 
       if (!f || !t || !r) {
-        Serial.println("[MAIN] Missing one or more required characteristics; rescanning...");
+        Serial.println("[MAIN] Missing required characteristics; rescanning...");
         d.disconnect();
         BLE.scanForName(RECEIVER_NAME);
         continue;
       }
 
-      // Subscribe to notifications
       bool ok = true;
       if (!f.canSubscribe() || !f.subscribe()) ok = false;
       if (!t.canSubscribe() || !t.subscribe()) ok = false;
@@ -88,6 +84,25 @@ bool connectToReceiver() {
     BLE.poll();
     delay(5);
   }
+}
+
+// ---- UART write: 20-byte chunks ----
+void writeUartRXChunked(const uint8_t* data, size_t len) {
+  const size_t CHUNK = 20;
+  for (size_t i = 0; i < len; i += CHUNK) {
+    size_t n = (len - i < CHUNK) ? (len - i) : CHUNK;
+    chUartRX.writeValue(data + i, n);
+    BLE.poll();
+  }
+}
+void sendLineToReceiver(const char* msg) {
+  char line[128];
+  size_t m = strlen(msg);
+  if (m > sizeof(line) - 2) m = sizeof(line) - 2;
+  memcpy(line, msg, m);
+  line[m++] = '\n';
+  line[m] = 0;
+  writeUartRXChunked((const uint8_t*)line, m);
 }
 
 String serialBuf;
@@ -114,39 +129,32 @@ void loop() {
     return;
   }
 
-  // Print CSV header once
+  // CSV header once
   if (!headerPrinted) {
     Serial.println("ms,pounds");
     headerPrinted = true;
   }
 
-  // Handle incoming force data
+  // Incoming force data
   if (chForce && chForce.valueUpdated()) {
     char buf[64] = {0};
     int n = chForce.readValue((uint8_t*)buf, sizeof(buf)-1);
     if (n > 0) {
-      // Expect "<ms>|<lbs>"
       char* bar = strchr(buf, '|');
       if (bar) {
         *bar = '\0';
         unsigned long ms = strtoul(buf, NULL, 10);
         float pounds = atof(bar + 1);
-
-        // CSV line
-        Serial.print(ms);
-        Serial.print(",");
-        Serial.println(pounds, 2);
+        Serial.print(ms); Serial.print(","); Serial.println(pounds, 2);
       } else {
-        // If it's not delimited, just dump it
-        Serial.print("#WARN raw: ");
-        Serial.println(buf);
+        Serial.print("#WARN raw: "); Serial.println(buf);
       }
     }
   }
 
-  // Handle incoming chat from Receiver
+  // Incoming chat from Receiver
   if (chUartTX && chUartTX.valueUpdated()) {
-    uint8_t buf[201] = {0};
+    uint8_t buf[64] = {0};
     int n = chUartTX.readValue(buf, sizeof(buf)-1);
     if (n > 0) {
       Serial.print("RECV> ");
@@ -155,19 +163,17 @@ void loop() {
     }
   }
 
-  // Read Main’s Serial → send to Receiver via UART RX
+  // Read MAIN Serial → send to Receiver
   while (Serial.available()) {
     char c = (char)Serial.read();
     if (c == '\r') continue;
     if (c == '\n') {
       if (serialBuf.length()) {
-        const char* msg = serialBuf.c_str();
-        size_t len = serialBuf.length();
-        if (len <= 200) chUartRX.writeValue((const uint8_t*)msg, len);
+        sendLineToReceiver(serialBuf.c_str());
         serialBuf = "";
       }
     } else {
-      if (serialBuf.length() < 200) serialBuf += c;
+      if (serialBuf.length() < 120) serialBuf += c;
     }
   }
 
