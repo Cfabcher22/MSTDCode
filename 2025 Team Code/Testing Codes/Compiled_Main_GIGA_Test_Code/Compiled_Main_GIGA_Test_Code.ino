@@ -1,169 +1,175 @@
 /*
-  Arduino GIGA R1 WiFi — BLE Central with status prints + CSV data
+  GIGA R1 WiFi — MAIN
+  Role: CENTRAL to "GIGA_RECEIVER"
 
-  Target peripheral:
-    Name         : "NRF_FORCE_1"
-    Service UUID : 180C
-    Char UUID    : 2A56
-    Payload      : "ms_since_connect|pounds"
+  Subscribes to:
+    - Force Forward Char: b39a1002-0f3b-4b6c-a8ad-5c8471a40101 (payload "<ms>|<lbs>")
+    - UART TX (from Receiver): 6e400003-b5a3-f393-e0a9-e50e24dcca9e
 
-  Serial output:
-    # GIGA: SCANNING (waiting for advertising)...
-    # GIGA: ADVERTISING detected from "NRF_FORCE_1" addr=XX:XX:...
-    # GIGA: CONNECT ATTEMPT...
-    # GIGA: CONNECTED.
-    # GIGA: SUBSCRIBED.
-    # GIGA: DISCONNECTED. Rescanning...
-    (data) ms,pounds
+  Writes to:
+    - UART RX (to Receiver): 6e400002-b5a3-f393-e0a9-e50e24dcca9e
 
-  Data lines are CSV only:  ms,pounds
+  Usage:
+    - Open Serial Monitor (115200) on MAIN, type a line and press enter → sent to Receiver.
+    - Chat from Receiver appears with "RECV>".
+    - Force stream prints CSV as: ms,pounds
 */
 
 #include <ArduinoBLE.h>
 
-const char* TARGET_NAME  = "NRF_FORCE_1";
-const char* SERVICE_UUID = "180C";
-const char* CHAR_UUID    = "2A56";
+static const char* RECEIVER_NAME = "GIGA_RECEIVER";
 
-BLEDevice         peripheral;
-BLECharacteristic forceChar;
+// UUIDs (must match Receiver)
+#define FORWARD_CHAR_UUID "b39a1002-0f3b-4b6c-a8ad-5c8471a40101"
+#define UART_TX_UUID      "6e400003-b5a3-f393-e0a9-e50e24dcca9e" // Notify from Receiver
+#define UART_RX_UUID      "6e400002-b5a3-f393-e0a9-e50e24dcca9e" // Write to Receiver
 
-bool headerPrinted     = false;
-bool scanningAnnounced = false;
+BLEDevice         rxDev;
+BLECharacteristic chForce;
+BLECharacteristic chUartTX;
+BLECharacteristic chUartRX;
 
-// ---------- Helpers ----------
-bool hasService(BLEDevice& dev, const char* uuid) {
-  int n = dev.advertisedServiceUuidCount();
-  for (int i = 0; i < n; i++) {
-    if (dev.advertisedServiceUuid(i) == uuid) return true;
+bool headerPrinted = false;
+static const uint32_t SERIAL_BAUD = 115200;
+
+bool connectToReceiver() {
+  Serial.println("[MAIN] Scanning for GIGA_RECEIVER ...");
+  BLE.scanForName(RECEIVER_NAME);
+
+  while (true) {
+    BLEDevice d = BLE.available();
+    if (d && d.hasLocalName() && d.localName() == RECEIVER_NAME) {
+      Serial.println("[MAIN] Found Receiver, connecting...");
+      BLE.stopScan();
+
+      if (!d.connect()) {
+        Serial.println("[MAIN] connect() failed, rescanning...");
+        BLE.scanForName(RECEIVER_NAME);
+        continue;
+      }
+      if (!d.discoverAttributes()) {
+        Serial.println("[MAIN] discoverAttributes() failed, rescanning...");
+        d.disconnect();
+        BLE.scanForName(RECEIVER_NAME);
+        continue;
+      }
+
+      BLECharacteristic f = d.characteristic(FORWARD_CHAR_UUID);
+      BLECharacteristic t = d.characteristic(UART_TX_UUID);
+      BLECharacteristic r = d.characteristic(UART_RX_UUID);
+
+      if (!f || !t || !r) {
+        Serial.println("[MAIN] Missing one or more required characteristics; rescanning...");
+        d.disconnect();
+        BLE.scanForName(RECEIVER_NAME);
+        continue;
+      }
+
+      // Subscribe to notifications
+      bool ok = true;
+      if (!f.canSubscribe() || !f.subscribe()) ok = false;
+      if (!t.canSubscribe() || !t.subscribe()) ok = false;
+      if (!ok) {
+        Serial.println("[MAIN] subscribe() failed; rescanning...");
+        d.disconnect();
+        BLE.scanForName(RECEIVER_NAME);
+        continue;
+      }
+
+      rxDev   = d;
+      chForce = f;
+      chUartTX= t;
+      chUartRX= r;
+
+      Serial.println("[MAIN] Connected & subscribed.");
+      headerPrinted = false;
+      return true;
+    }
+    BLE.poll();
+    delay(5);
   }
-  return false;
 }
 
-bool connectAndSubscribe(BLEDevice& dev) {
-  Serial.println("# GIGA: CONNECT ATTEMPT...");
-  if (!dev.connect()) {
-    Serial.println("# GIGA: connect() failed");
-    return false;
-  }
-
-  Serial.println("# GIGA: CONNECTED. Discovering attributes...");
-  if (!dev.discoverAttributes()) {
-    Serial.println("# GIGA: discoverAttributes() failed");
-    dev.disconnect();
-    return false;
-  }
-
-  forceChar = dev.characteristic(CHAR_UUID);
-  if (!forceChar) {
-    Serial.println("# GIGA: characteristic 2A56 not found");
-    dev.disconnect();
-    return false;
-  }
-
-  if (!forceChar.canSubscribe()) {
-    Serial.println("# GIGA: characteristic not subscribable");
-    dev.disconnect();
-    return false;
-  }
-
-  if (!forceChar.subscribe()) {
-    Serial.println("# GIGA: subscribe() failed");
-    dev.disconnect();
-    return false;
-  }
-
-  Serial.println("# GIGA: SUBSCRIBED.");
-  return true;
-}
-
-// Optional: event handlers (extra clarity on disconnects)
-void onBLEDisconnected(BLEDevice dev) {
-  Serial.println("# GIGA: DISCONNECTED. Rescanning...");
-}
+String serialBuf;
 
 void setup() {
-  Serial.begin(115200);
-  while (!Serial && millis() < 3000) { /* wait up to 3s */ }
+  Serial.begin(SERIAL_BAUD);
+  while (!Serial && millis() < 2000) {}
 
   if (!BLE.begin()) {
-    Serial.println("# GIGA: BLE.begin() failed");
+    Serial.println("[MAIN] BLE.begin() failed");
     while (1) {}
   }
 
-  BLE.setEventHandler(BLEDisconnected, onBLEDisconnected);
-
-  Serial.println("# GIGA: SCANNING (waiting for advertising)...");
-  BLE.scanForName(TARGET_NAME);      // you can also use BLE.scan() and filter by service
-  scanningAnnounced = true;
+  connectToReceiver();
 }
 
 void loop() {
-  // If not connected, keep scanning until we see the target and can connect.
-  if (!peripheral || !peripheral.connected()) {
-    BLEDevice found = BLE.available();
-    if (found) {
-      Serial.print("# GIGA: ADVERTISING detected from \"");
-      Serial.print(found.localName());
-      Serial.print("\" addr=");
-      Serial.println(found.address());
-
-      if (found.localName() == TARGET_NAME || hasService(found, SERVICE_UUID)) {
-        BLE.stopScan();
-        if (connectAndSubscribe(found)) {
-          peripheral = found;
-          headerPrinted     = false; // print CSV header once per session
-          scanningAnnounced = false; // so we can announce scanning again after disconnect
-        } else {
-          // Resume scanning if connection/subscription failed
-          Serial.println("# GIGA: Resuming scan...");
-          BLE.scanForName(TARGET_NAME);
-          scanningAnnounced = true;
-        }
-      }
-    } else {
-      // Periodically remind we're scanning (not too chatty)
-      static unsigned long lastScanMsg = 0;
-      if (!scanningAnnounced || millis() - lastScanMsg > 5000) {
-        Serial.println("# GIGA: SCANNING (waiting for advertising)...");
-        scanningAnnounced = true;
-        lastScanMsg = millis();
-      }
-    }
-    return; // continue scanning
-  }
-
-  // Connected: handle notifications only (print data as CSV)
   BLE.poll();
 
-  if (!peripheral.connected()) {
-    // Event handler already printed a line; restart scanning.
-    BLE.scanForName(TARGET_NAME);
-    scanningAnnounced = false;
+  // Reconnect if needed
+  if (!rxDev || !rxDev.connected()) {
+    Serial.println("[MAIN] Receiver disconnected; reconnecting...");
+    connectToReceiver();
     return;
   }
 
+  // Print CSV header once
   if (!headerPrinted) {
     Serial.println("ms,pounds");
     headerPrinted = true;
   }
 
-  if (forceChar && forceChar.valueUpdated()) {
+  // Handle incoming force data
+  if (chForce && chForce.valueUpdated()) {
     char buf[64] = {0};
-    int n = forceChar.readValue((uint8_t*)buf, sizeof(buf) - 1);
+    int n = chForce.readValue((uint8_t*)buf, sizeof(buf)-1);
     if (n > 0) {
-      // Expected "ms|pounds"
-      char *bar = strchr(buf, '|');
+      // Expect "<ms>|<lbs>"
+      char* bar = strchr(buf, '|');
       if (bar) {
-        *bar = '\0';                         // split in-place
+        *bar = '\0';
         unsigned long ms = strtoul(buf, NULL, 10);
         float pounds = atof(bar + 1);
 
-        // CSV data line
+        // CSV line
         Serial.print(ms);
         Serial.print(",");
         Serial.println(pounds, 2);
+      } else {
+        // If it's not delimited, just dump it
+        Serial.print("#WARN raw: ");
+        Serial.println(buf);
       }
     }
   }
+
+  // Handle incoming chat from Receiver
+  if (chUartTX && chUartTX.valueUpdated()) {
+    uint8_t buf[201] = {0};
+    int n = chUartTX.readValue(buf, sizeof(buf)-1);
+    if (n > 0) {
+      Serial.print("RECV> ");
+      Serial.write(buf, n);
+      Serial.println();
+    }
+  }
+
+  // Read Main’s Serial → send to Receiver via UART RX
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      if (serialBuf.length()) {
+        const char* msg = serialBuf.c_str();
+        size_t len = serialBuf.length();
+        if (len <= 200) chUartRX.writeValue((const uint8_t*)msg, len);
+        serialBuf = "";
+      }
+    } else {
+      if (serialBuf.length() < 200) serialBuf += c;
+    }
+  }
+
+  delay(2);
 }
