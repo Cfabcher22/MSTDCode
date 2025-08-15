@@ -3,13 +3,13 @@
 
   Subscribes to:
     - Force Forward: b39a1002-0f3b-4b6c-a8ad-5c8471a40101 ("<ms>|<lbs>")
-    - UART TX (from Receiver): 6e400003-b5a3-f393-e0a9-e50e24dcca9e
+    - UART TX (Receiver -> Main): 6e400003-b5a3-f393-e0a9-e50e24dcca9e
   Writes to:
-    - UART RX (to Receiver): 6e400002-b5a3-f393-e0a9-e50e24dcca9e
+    - UART RX (Main -> Receiver): 6e400002-b5a3-f393-e0a9-e50e24dcca9e
 
   Serial (115200):
-    - Prints "ms,pounds" header, then CSV lines.
-    - Type a line + Enter to send chat to Receiver.
+    - Prints "ms,pounds" header then CSV lines
+    - Type a line + Enter to send chat to Receiver
 */
 
 #include <Arduino.h>
@@ -86,7 +86,7 @@ bool connectToReceiver() {
   }
 }
 
-// ---- UART write: 20-byte chunks ----
+// ---- UART write: 20-byte chunks + newline termination ----
 void writeUartRXChunked(const uint8_t* data, size_t len) {
   const size_t CHUNK = 20;
   for (size_t i = 0; i < len; i += CHUNK) {
@@ -137,7 +137,7 @@ void loop() {
 
   // Incoming force data
   if (chForce && chForce.valueUpdated()) {
-    char buf[64] = {0};
+    char buf[48] = {0};
     int n = chForce.readValue((uint8_t*)buf, sizeof(buf)-1);
     if (n > 0) {
       char* bar = strchr(buf, '|');
