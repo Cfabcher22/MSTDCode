@@ -1,28 +1,36 @@
 /*
   XIAO nRF52840 — NRF_FORCE_1 (BLE Peripheral)
-  - Service: 0x180C (custom usage)
-  - Char   : 0x2A56 (Notify) — payload "<ms>|<lbs>"
-  - HX711 on DOUT=2, CLK=3
+  Sends "<ms>|<lbs>" every 500 ms AFTER a central connects.
+
+  BLE:
+    Service: 0x180C
+    Char   : 0x2A56  (Notify + Read)
+
+  HX711 pins (adjust if needed):
+    DOUT=2, CLK=3
 */
 
 #include <Arduino.h>
 #include <ArduinoBLE.h>
 #include "HX711.h"
 
-// ---- HX711 pins (adjust if needed) ----
+// ===== HX711 =====
 #define DOUT 2
 #define CLK  3
-
 HX711 scale;
 
-// ---- Calibration (adjust to your load cell) ----
-const float CAL_FACTOR = -20767.5f;  // matches your prior notes
+// Adjust to your load cell calibration
+const float CAL_FACTOR = -20767.5f;
 
-// ---- BLE (standard 180C with 2A56 char used as custom notify) ----
-BLEService forceService("180C");
-BLECharacteristic forceChar("2A56", BLENotify | BLERead, 64);  // "<ms>|<lbs>"
+// ===== BLE (180C / 2A56) =====
+BLEService        forceService("180C");
+BLECharacteristic forceChar("2A56", BLENotify | BLERead, 48);
 
-unsigned long t0 = 0;
+// ===== Timing =====
+const unsigned long SEND_INTERVAL_MS = 500;  // <-- requested rate
+unsigned long t0 = 0;         // ms at connect
+unsigned long lastSend = 0;   // last notification time
+bool wasConnected = false;
 
 void setup() {
   Serial.begin(115200);
@@ -32,12 +40,10 @@ void setup() {
   scale.begin(DOUT, CLK);
   delay(200);
   Serial.println("NRF: waiting for HX711...");
-  while (!scale.is_ready()) {
-    delay(100);
-  }
+  while (!scale.is_ready()) { delay(50); }
   scale.set_scale(CAL_FACTOR);
   scale.tare();
-  delay(500);
+  delay(300);
   Serial.println("NRF: HX711 ready.");
 
   // BLE init
@@ -45,6 +51,7 @@ void setup() {
     Serial.println("NRF: BLE.begin() failed");
     while (1) {}
   }
+
   BLE.setLocalName("NRF_FORCE_1");
   BLE.setDeviceName("NRF_FORCE_1");
   BLE.setAdvertisedService(forceService);
@@ -52,35 +59,56 @@ void setup() {
   forceService.addCharacteristic(forceChar);
   BLE.addService(forceService);
 
-  // seed
-  forceChar.writeValue((const uint8_t*)"0|0.0", 5);
+  // Seed a value so readers have something immediately after subscribe
+  forceChar.writeValue((const uint8_t*)"0|0.00", 6);
 
   BLE.advertise();
   Serial.println("NRF: advertising as NRF_FORCE_1");
-  t0 = millis();
 }
 
 void loop() {
   BLE.poll();
 
-  // Read one sample; avoid long averaging to keep latency low
-  long raw = scale.read();  // single read
-  float pounds = (raw - scale.get_offset()) / scale.get_scale();
+  bool isConnected = BLE.connected();
 
-  // Clamp noise near zero if you want (optional)
-  if (fabs(pounds) < 0.05f) pounds = 0.0f;
+  // Edge: just connected
+  if (isConnected && !wasConnected) {
+    t0 = millis();
+    lastSend = 0;  // force immediate send on next tick
+    Serial.println("NRF: central connected");
+  }
 
-  // Every ~100 ms, notify "<ms>|<lbs>"
-  static unsigned long last = 0;
-  unsigned long now = millis();
-  if (now - last >= 100) {
-    last = now;
-    char msg[48];
-    int n = snprintf(msg, sizeof(msg), "%lu|%.2f", now - t0, pounds);
-    if (n > 0) {
-      forceChar.writeValue((const uint8_t*)msg, (size_t)n);
-      // Debug:
-      // Serial.print("NRF OUT: "); Serial.println(msg);
+  // Edge: just disconnected
+  if (!isConnected && wasConnected) {
+    Serial.println("NRF: central disconnected (still advertising)");
+  }
+
+  wasConnected = isConnected;
+
+  // Only stream when a central is connected
+  if (isConnected) {
+    unsigned long now = millis();
+    if (now - lastSend >= SEND_INTERVAL_MS) {
+      lastSend = now;
+
+      // Read HX711 (non-blocking style)
+      float pounds = 0.0f;
+      if (scale.is_ready()) {
+        long raw = scale.read();  // single conversion
+        pounds = (raw - scale.get_offset()) / scale.get_scale();
+      }
+
+      // Optional small deadband around zero
+      if (fabs(pounds) < 0.05f) pounds = 0.00f;
+
+      char msg[40];
+      int n = snprintf(msg, sizeof(msg), "%lu|%.2f", now - t0, pounds);
+      if (n > 0) {
+        // Notify subscribers
+        forceChar.writeValue((const uint8_t*)msg, (size_t)n);
+        // Debug (optional):
+        // Serial.print("NRF OUT: "); Serial.println(msg);
+      }
     }
   }
 

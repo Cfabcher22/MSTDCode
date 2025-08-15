@@ -1,95 +1,50 @@
 /*
-  GIGA R1 WiFi — RECEIVER (stabilized)
-  - CENTRAL to nRF "NRF_FORCE_1" (180C/2A56) -> polls every 100 ms for "<ms>|<lbs>"
-  - PERIPHERAL to MAIN "GIGA_RECEIVER":
-      * Force Forward (Notify): b39a1002-0f3b-4b6c-a8ad-5c8471a40101
-      * Simple ping-pong (every 3 s after connect):
-          - Receiver -> Main (Notify TX): "Hello MSTD Team"
-          - Main replies (Write RX): "Devil Dog!"
-  Changes:
-    * Gate all notifies until MAIN is connected (prevents crashes / red LED flashing)
-    * Remove periodic advertise() spam; advertise once and rely on stack
-    * Wait 1s after MAIN connection before first hello
+  Arduino GIGA R1 WiFi — RECEIVER (Forward-only)
+
+  Roles:
+    - CENTRAL to nRF "NRF_FORCE_1"
+        * Service: 0x180C
+        * Char   : 0x2A56
+        * Payload: "<ms>|<lbs>"
+        * Subscribes (if possible) AND actively polls every 100 ms
+          with de-duplication so you get continuous updates reliably.
+    - PERIPHERAL to MAIN "GIGA_RECEIVER"
+        * Service: b39a1001-0f3b-4b6c-a8ad-5c8471a40101
+        * Char   : b39a1002-0f3b-4b6c-a8ad-5c8471a40101  (Notify/Read)
+        * Forwards the nRF payload unchanged to MAIN (Notify when subscribed).
+
+  Serial (115200): Prints the forwarded line for quick verification.
 */
 
 #include <Arduino.h>
 #include <ArduinoBLE.h>
 
-// ---------- Upstream (nRF as peripheral) ----------
+// -------- Upstream (nRF) --------
 static const char* NRF_NAME = "NRF_FORCE_1";
 #define NRF_SERVICE_UUID_STD "180C"
 #define NRF_CHAR_UUID_STD    "2A56"
 
-// ---------- Downstream (to Main as our central) ----------
+// -------- Downstream (to MAIN) --------
 static const char* RECEIVER_NAME = "GIGA_RECEIVER";
-
-// Force Forward service/char
 #define FORWARD_SERVICE_UUID "b39a1001-0f3b-4b6c-a8ad-5c8471a40101"
 #define FORWARD_CHAR_UUID    "b39a1002-0f3b-4b6c-a8ad-5c8471a40101"
 
-// UART-like tiny ping/pong (Nordic NUS style)
-#define UART_SERVICE_UUID "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
-#define UART_TX_UUID      "6e400003-b5a3-f393-e0a9-e50e24dcca9e" // Notify to Main
-#define UART_RX_UUID      "6e400002-b5a3-f393-e0a9-e50e24dcca9e" // Write  from Main
-
-// ---------- Peripheral objects (to Main) ----------
+// Peripheral (to MAIN)
 BLEService        forwardService(FORWARD_SERVICE_UUID);
 BLECharacteristic forwardChar(FORWARD_CHAR_UUID, BLERead | BLENotify, 48);
 
-BLEService        uartService(UART_SERVICE_UUID);
-BLECharacteristic uartTX(UART_TX_UUID, BLERead | BLENotify, 24);
-BLECharacteristic uartRX(UART_RX_UUID, BLEWrite | BLEWriteWithoutResponse, 24);
-
-// ---------- Central handles (to nRF) ----------
+// Central handles (to nRF)
 BLEDevice         nrfDev;
 BLECharacteristic nrfChar;
 
-// ---------- Main GIGA connection state ----------
-volatile bool mainConnected = false;
-unsigned long mainConnectedAt = 0;   // ms timestamp when MAIN connected
+// Polling / de-dup
+unsigned long lastPollMs = 0;
+char          lastMsg[48] = {0};
+int           lastMsgLen  = 0;
 
-// ---------- Timers ----------
-unsigned long lastPollMs  = 0;  // nRF read poll
-unsigned long lastHelloMs = 0;  // periodic Hello
+static const uint32_t SERIAL_BAUD = 115200;
 
-// ---- UART helpers (keep ≤20B/packet) ----
-static inline void notifySmall(const char* s) {
-  size_t len = strlen(s);
-  const size_t CHUNK = 20;
-  for (size_t i = 0; i < len; i += CHUNK) {
-    size_t n = (len - i < CHUNK) ? (len - i) : CHUNK;
-    uartTX.writeValue((const uint8_t*)s + i, n);
-    BLE.poll();
-  }
-}
-
-// ---- Event handlers for MAIN central ----
-void onMainConnected(BLEDevice central) {
-  mainConnected = true;
-  mainConnectedAt = millis();
-  // Seed characteristics so subscribers have an initial value:
-  uartTX.writeValue((const uint8_t*)"ready\n", 6);
-  forwardChar.writeValue((const uint8_t*)"0|0.00", 6);
-  Serial.print("[RECV] MAIN connected: "); Serial.println(central.address());
-}
-
-void onMainDisconnected(BLEDevice central) {
-  mainConnected = false;
-  Serial.print("[RECV] MAIN disconnected: "); Serial.println(central.address());
-}
-
-// MAIN wrote "Devil Dog!" to us (or anything else): just print it
-void onUartRXWritten(BLEDevice, BLECharacteristic) {
-  uint8_t buf[24] = {0};
-  int n = uartRX.readValue(buf, sizeof(buf));
-  if (n > 0) {
-    Serial.print("[RECV] From MAIN: ");
-    Serial.write(buf, n);
-    Serial.println();
-  }
-}
-
-// ---- Debug helper if nRF UUIDs differ ----
+// --- Debug helper if UUIDs mismatch ---
 void dumpServices(BLEDevice& d) {
   Serial.println("[RECV] Services/Characteristics on NRF:");
   int svcCount = d.serviceCount();
@@ -114,6 +69,7 @@ bool resolveNRFCharacteristic(BLEDevice& d, BLECharacteristic& out) {
   if (svcStd) {
     BLECharacteristic c2 = svcStd.characteristic(NRF_CHAR_UUID_STD);
     if (c2) { out = c2; return true; }
+    // Fallback: first notifiable in 180C
     int chCount = svcStd.characteristicCount();
     for (int i = 0; i < chCount; i++) {
       BLECharacteristic c = svcStd.characteristic(i);
@@ -127,26 +83,16 @@ void setupPeripheral() {
   BLE.setLocalName(RECEIVER_NAME);
   BLE.setDeviceName(RECEIVER_NAME);
 
-  // Advertise forward service (others available post-connect)
+  // Advertise forward service (others still accessible after connect)
   BLE.setAdvertisedService(forwardService);
 
   forwardService.addCharacteristic(forwardChar);
-  uartService.addCharacteristic(uartTX);
-  uartService.addCharacteristic(uartRX);
-
   BLE.addService(forwardService);
-  BLE.addService(uartService);
-
-  // Event handlers for MAIN connect/disconnect + RX writes
-  BLE.setEventHandler(BLEConnected,    onMainConnected);
-  BLE.setEventHandler(BLEDisconnected, onMainDisconnected);
-  uartRX.setEventHandler(BLEWritten,   onUartRXWritten);
 
   forwardChar.writeValue((const uint8_t*)"0|0.00", 6);
-  uartTX.writeValue((const uint8_t*)"ready\n", 6);
 
-  BLE.advertise();               // advertise once; no periodic re-advertising
-  Serial.println("[RECV] Advertising as GIGA_RECEIVER (Force+UART)...");
+  BLE.advertise();  // advertise once
+  Serial.println("[RECV] Advertising as GIGA_RECEIVER (Forward-only)...");
 }
 
 bool connectToNRF() {
@@ -182,7 +128,7 @@ bool connectToNRF() {
 
       if (c.canSubscribe()) {
         if (!c.subscribe()) {
-          Serial.println("[RECV] NRF subscribe failed; will use polling only.");
+          Serial.println("[RECV] NRF subscribe failed; will rely on polling.");
         } else {
           Serial.println("[RECV] Subscribed to NRF notifications.");
         }
@@ -192,8 +138,8 @@ bool connectToNRF() {
       nrfChar = c;
       Serial.print("[RECV] Using NRF char "); Serial.println(nrfChar.uuid());
 
-      lastPollMs  = millis();
-      lastHelloMs = millis();
+      lastPollMs = millis();
+      lastMsg[0] = 0; lastMsgLen = 0;
       return true;
     }
     BLE.poll();
@@ -202,7 +148,7 @@ bool connectToNRF() {
 }
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(SERIAL_BAUD);
   while (!Serial && millis() < 2000) {}
 
   if (!BLE.begin()) {
@@ -217,7 +163,7 @@ void setup() {
 void loop() {
   BLE.poll();
 
-  // Reconnect to nRF if needed (don’t spam the stack)
+  // Reconnect to nRF if needed (rate-limited to avoid stack churn)
   if (!nrfDev || !nrfDev.connected()) {
     static unsigned long lastAttempt = 0;
     if (millis() - lastAttempt > 1000) {
@@ -228,27 +174,25 @@ void loop() {
     return;
   }
 
+  // Continuous stream: actively poll nRF every 100 ms, with de-dup
   unsigned long now = millis();
-
-  // 1) Continuous force stream: actively poll nRF every 100 ms
   if (now - lastPollMs >= 100) {
     lastPollMs = now;
 
-    uint8_t buf[48] = {0};
-    int n = nrfChar.readValue(buf, sizeof(buf) - 1);  // poll read
+    char buf[48] = {0};
+    int n = nrfChar.readValue((uint8_t*)buf, sizeof(buf) - 1);  // poll read
     if (n > 0) {
-      forwardChar.writeValue(buf, n);  // forward to MAIN (notify)
-      Serial.print("[RECV] Force: ");
-      Serial.println((char*)buf);
-    }
-  }
-
-  // 2) Send "Hello MSTD Team" every 3 s — ONLY if MAIN is connected
-  if (mainConnected && (now - mainConnectedAt) >= 1000) { // wait 1s after connect
-    if (now - lastHelloMs >= 3000) {
-      lastHelloMs = now;
-      notifySmall("Hello MSTD Team");
-      Serial.println("[RECV] Sent: Hello MSTD Team");
+      // De-duplicate to avoid resending unchanged values
+      bool changed = (n != lastMsgLen) || memcmp(buf, lastMsg, n) != 0;
+      if (changed) {
+        forwardChar.writeValue((const uint8_t*)buf, n);  // notify if subscribed
+        // Local debug
+        Serial.print("[RECV] "); Serial.println(buf);
+        // Save last
+        memcpy(lastMsg, buf, n);
+        lastMsg[n] = 0;
+        lastMsgLen = n;
+      }
     }
   }
 
