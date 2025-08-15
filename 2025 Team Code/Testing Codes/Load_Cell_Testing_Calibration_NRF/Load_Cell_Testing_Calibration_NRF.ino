@@ -2,7 +2,7 @@
   Board Selection Required:
   -------------------------
   In Arduino IDE, go to:
-  Tools → Board → Seeed nRF52 Boards → "XIAO nRF52840 (No Updates)"
+  Tools → Board → Seeed nRF52 mbed-enabled Boards → "XIAO nRF52840 (No Updates)"
   Seeed Stuido XIAO nRF52840 board package and instructions added from
   the following URL: https://wiki.seeedstudio.com/XIAO_BLE/
 
