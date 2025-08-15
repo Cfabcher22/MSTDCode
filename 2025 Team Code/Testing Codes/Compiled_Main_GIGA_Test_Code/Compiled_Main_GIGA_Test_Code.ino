@@ -1,31 +1,23 @@
 /*
-  GIGA R1 WiFi — MAIN (Central to GIGA_RECEIVER)
+  Arduino GIGA R1 WiFi — MAIN (Print CSV)
 
-  Subscribes to:
-    - Force Forward Char: b39a1002-0f3b-4b6c-a8ad-5c8471a40101 ("<ms>|<lbs>")
-    - UART TX (Receiver -> Main): 6e400003-b5a3-f393-e0a9-e50e24dcca9e
-  Writes to:
-    - UART RX (Main -> Receiver): 6e400002-b5a3-f393-e0a9-e50e24dcca9e
+  Connects to: "GIGA_RECEIVER"
+  Subscribes to Forward Char:
+    - Service: b39a1001-0f3b-4b6c-a8ad-5c8471a40101
+    - Char   : b39a1002-0f3b-4b6c-a8ad-5c8471a40101 (Notify/Read)
+  Payload: "<ms>|<lbs>"
 
-  Behavior:
-    - Prints "ms,pounds" header then CSV lines as they arrive.
-    - Whenever it receives "Hello MSTD Team" from Receiver, replies "Devil Dog!".
+  Serial (115200): prints "ms,pounds" then continuous CSV rows.
 */
 
 #include <Arduino.h>
 #include <ArduinoBLE.h>
 
 static const char* RECEIVER_NAME = "GIGA_RECEIVER";
-
 #define FORWARD_CHAR_UUID "b39a1002-0f3b-4b6c-a8ad-5c8471a40101"
-#define UART_TX_UUID      "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
-#define UART_RX_UUID      "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 
 BLEDevice         rxDev;
 BLECharacteristic chForce;
-BLECharacteristic chUartTX;
-BLECharacteristic chUartRX;
-
 bool headerPrinted = false;
 
 bool connectToReceiver() {
@@ -51,20 +43,14 @@ bool connectToReceiver() {
       }
 
       BLECharacteristic f = d.characteristic(FORWARD_CHAR_UUID);
-      BLECharacteristic t = d.characteristic(UART_TX_UUID);
-      BLECharacteristic r = d.characteristic(UART_RX_UUID);
-
-      if (!f || !t || !r) {
-        Serial.println("[MAIN] Missing required characteristics; rescanning...");
+      if (!f) {
+        Serial.println("[MAIN] Forward char missing; rescanning...");
         d.disconnect();
         BLE.scanForName(RECEIVER_NAME);
         continue;
       }
 
-      bool ok = true;
-      if (!f.canSubscribe() || !f.subscribe()) ok = false;
-      if (!t.canSubscribe() || !t.subscribe()) ok = false;
-      if (!ok) {
+      if (!f.canSubscribe() || !f.subscribe()) {
         Serial.println("[MAIN] subscribe() failed; rescanning...");
         d.disconnect();
         BLE.scanForName(RECEIVER_NAME);
@@ -73,9 +59,6 @@ bool connectToReceiver() {
 
       rxDev   = d;
       chForce = f;
-      chUartTX= t;
-      chUartRX= r;
-
       Serial.println("[MAIN] Connected & subscribed.");
       headerPrinted = false;
       return true;
@@ -83,13 +66,6 @@ bool connectToReceiver() {
     BLE.poll();
     delay(5);
   }
-}
-
-// --- Write small replies safely (<= 20 B per write) ---
-void sendReplyToReceiver(const char* msg) {
-  // keep under 20 B for default MTU; our string is tiny
-  chUartRX.writeValue((const uint8_t*)msg, strlen(msg));
-  BLE.poll();
 }
 
 void setup() {
@@ -114,13 +90,13 @@ void loop() {
     return;
   }
 
-  // CSV header once
+  // Print CSV header once
   if (!headerPrinted) {
     Serial.println("ms,pounds");
     headerPrinted = true;
   }
 
-  // Incoming force data (forwarded by Receiver)
+  // Handle incoming force data
   if (chForce && chForce.valueUpdated()) {
     char buf[48] = {0};
     int n = chForce.readValue((uint8_t*)buf, sizeof(buf)-1);
@@ -132,23 +108,8 @@ void loop() {
         float pounds = atof(bar + 1);
         Serial.print(ms); Serial.print(","); Serial.println(pounds, 2);
       } else {
+        // If it's not delimited, just dump it for debugging
         Serial.print("#WARN raw: "); Serial.println(buf);
-      }
-    }
-  }
-
-  // Incoming "Hello MSTD Team" from Receiver -> reply "Devil Dog!"
-  if (chUartTX && chUartTX.valueUpdated()) {
-    char inbuf[24] = {0};
-    int n = chUartTX.readValue((uint8_t*)inbuf, sizeof(inbuf)-1);
-    if (n > 0) {
-      // Optional: print what we got
-      Serial.print("[MAIN] Msg from RECV: ");
-      Serial.println(inbuf);
-
-      if (strncmp(inbuf, "Hello MSTD Team", 15) == 0) {
-        sendReplyToReceiver("Devil Dog!");
-        Serial.println("[MAIN] Replied: Devil Dog!");
       }
     }
   }
