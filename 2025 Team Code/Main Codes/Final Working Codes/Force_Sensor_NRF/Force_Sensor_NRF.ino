@@ -13,8 +13,9 @@
 // === PIN DEFINITIONS ===
 #define DOUT       2     // HX711 data pin
 #define CLK        3     // HX711 clock pin
-#define RED_LED    10    // Onboard RGB - Red channel
-#define GREEN_LED  11    // Onboard RGB - Green channel
+#define RED_LED    6    // Onboard RGB - Red channel
+#define GREEN_LED  7    // Onboard RGB - Green channel
+#define BLUE_LED   8    // Onboard RGB - Red channel
 #define BUTTON_PIN 4     // Jumper wire input for test start
 
 // === BLE SERVICE SETUP ===

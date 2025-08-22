@@ -1,87 +1,113 @@
 /*
-  Board Selection Required:
-  -------------------------
-  In Arduino IDE, go to:
-  Tools → Board → Seeed nRF52 mbed-enabled Boards → "XIAO nRF52840 (No Updates)"
-  Seeed Stuido XIAO nRF52840 board package and instructions added from
-  the following URL: https://wiki.seeedstudio.com/XIAO_BLE/
-
- ========== VARIABLE KEY ==========
-  DOUT, CLK:     HX711 digital data and clock pins
-  scale:         HX711 scale object
-  calibrationMode: Toggle between calibration mode and normal operation
-  knownWeight:   Known weight used during calibration (in pounds)
-  calibrationFactor: Factor used to convert raw HX711 readings to pounds
-==================================== */
-
+  ==========================================================================
+  SKETCH 4: Baseline-Aware Dead Zone + Time/Weight Printing
+  ==========================================================================
+  - While |raw| ≤ DEAD_ZONE, show 0 and continuously track a baseline offset.
+  - When |raw| > DEAD_ZONE, subtract the *tracked baseline* (not DEAD_ZONE).
+    Example: baseline ≈ 3, raw = 18  => shown = 15 (correct true load).
+  - Serial output (works with Serial Plotter):
+      time_s:<val>\tweight_lbs:<val>
+  ==========================================================================
+*/
 #include "HX711.h"
 
-#define DOUT 2  // HX711 Data pin
-#define CLK  3  // HX711 Clock pin
-
-HX711 scale;
+// === PIN DEFINITIONS ===
+#define DOUT 2
+#define CLK  3
 
 // === USER SETTINGS ===
-bool calibrationMode = false;         // Set to true to calibrate
-float knownWeight = 15.1;             // lbs
-float calibrationFactor = -20767.5;   // Replace with your factor
+const float myCalibrationFactor = -41535;     // your factor
+#define STABILIZATION_SECONDS 1               // warmup before tare
 
-unsigned long startTime = 0;          // For tracking elapsed time
+// Dead-zone *threshold* (when |raw| ≤ this, treat as baseline region)
+const float DEAD_ZONE = 10.0f;
+
+// How quickly the baseline follows near-zero drift (0.0..1.0)
+// Larger = slower changes. 0.90 is very steady but still adapts.
+const float BASELINE_ALPHA = 0.90f;
+
+// Sampling interval (ms)
+const unsigned long SAMPLE_INTERVAL_MS = 125; // ~8 Hz
+
+// === GLOBALS ===
+HX711 scale;
+unsigned long lastSampleMs = 0;
+bool measuring = false;
+
+// Tracked baseline offset (what gets subtracted when above the zone)
+float baselineOffset = 0.0f;
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("Time (s),Weight (lbs)");  // CSV header for Arduino Plotter
 
+  Serial.println("\n--- Load Cell: Baseline-Aware Dead Zone ---");
   scale.begin(DOUT, CLK);
-  delay(500);
+  scale.set_scale(myCalibrationFactor);
 
-  // Wait for HX711 to be ready
-  while (!scale.is_ready()) {
-    Serial.println("Waiting for HX711...");
-    delay(500);
+  Serial.print("Stabilizing for ");
+  Serial.print(STABILIZATION_SECONDS);
+  Serial.println(" seconds. Please wait...");
+  for (int i = STABILIZATION_SECONDS; i > 0; --i) {
+    delay(1000);
   }
 
-  if (calibrationMode) {
-    Serial.println("=== Calibration Mode ===");
-    Serial.println("Taring... Remove all weight.");
-    scale.set_scale();
-    scale.tare();
-    delay(1000);
+  Serial.println("\nTare...");
+  scale.tare(20);
+  baselineOffset = 0.0f; // start fresh after tare
 
-    Serial.println("Place known weight on scale...");
-    delay(5000);
+  Serial.println("Ready. Open Tools > Serial Plotter (115200).");
+  Serial.println("Plot shows time_s and weight_lbs.\n");
 
-    long raw = scale.get_units(10);  // Average of 10 readings
-    float factor = raw / knownWeight;
-
-    Serial.println("Raw average: " + String(raw));
-    Serial.println("Calibration factor: " + String(factor, 3));
-    Serial.println("Update 'calibrationFactor' and set 'calibrationMode = false'.");
-  } else {
-    scale.set_scale(calibrationFactor);
-    scale.tare();
-    delay(1000);
-    startTime = millis();  // Start timing for plotting
-  }
+  lastSampleMs = millis();
+  measuring = true;
 }
 
 void loop() {
-  if (!calibrationMode) {
-    if (scale.is_ready()) {
-      float weight = scale.get_units();
-      weight = weight / 2.0;              // Correct doubled reading
-      if (weight < 0) weight = 0.0;       // Clamp negatives
+  if (!measuring) return;
 
-      float timeSeconds = (millis() - startTime) / 1000.0;
+  unsigned long now = millis();
+  if (now - lastSampleMs < SAMPLE_INTERVAL_MS) return;
+  lastSampleMs = now;
 
-      // Output CSV for plotting: time, weight
-      Serial.print(timeSeconds, 2);
-      Serial.print(",");
-      Serial.println(weight, 2);
-    } else {
-      Serial.println("0,0");  // Default if HX711 not ready
+  if (!scale.is_ready()) {
+    static unsigned long lastWarn = 0;
+    if (now - lastWarn > 1000UL) {
+      Serial.println("HX711 not found.");
+      lastWarn = now;
     }
-    delay(100);  // Adjust plot smoothness
-  } 
+    return;
+  }
+
+  // Single-sample read (no averaging)
+  float raw = scale.get_units(1); // pounds (given your calibration)
+
+  // Update baseline when we're inside the dead-zone band
+  // The baseline tracks whatever small residual is present (e.g., +3 lb),
+  // so we can subtract *that* once we leave the zone.
+  if (fabs(raw) <= DEAD_ZONE) {
+    baselineOffset = BASELINE_ALPHA * baselineOffset + (1.0f - BASELINE_ALPHA) * raw;
+  }
+
+  // Compute displayed weight
+  float weight;
+  if (fabs(raw) <= DEAD_ZONE) {
+    // Inside zone: show 0
+    weight = 0.0f;
+  } else {
+    // Outside zone: subtract the *tracked* baseline
+    weight = raw - baselineOffset;
+
+    // Optional: clamp tiny negatives to zero (noise)
+    if (fabs(weight) < 0.05f) weight = 0.0f;
+  }
+
+  // Time in seconds
+  float time_s = now / 1000.0f;
+
+  // Print in tab-separated format for Serial Plotter
+  Serial.print("time_s:");
+  Serial.print(time_s, 2);
+  Serial.print("\tweight_lbs:");
+  Serial.println(weight, 2);
 }
